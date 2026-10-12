@@ -2320,10 +2320,21 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
     // If STACKNUDGE_ACTIVATE_IMMEDIATELY is set, focus the source editor
     // right away without waiting for the user to click; we skip cues
     // entirely in that flow since the editor jump is the signal.
+    // Every transcript read goes through one serial queue. These loops fan out
+    // per active session, and on the global concurrent queue that meant N
+    // simultaneous reads: with a dozen live agents that was enough concurrent
+    // work to starve the utility pool (the same thread explosion
+    // ProcessOutput.run documents at its own spawn site) and to stack N files'
+    // worth of parsing into a single peak. Serialised, N sessions cost one read
+    // at a time; stats arrive a beat apart rather than together, which no
+    // caller can observe.
+    private static let transcriptQueue = DispatchQueue(label: "stack-nudge.transcript-stats",
+                                                      qos: .utility)
+
     // Re-read the Claude Code transcript referenced by an incoming
-    // event and publish updated context-window stats to nav. Runs
-    // off-main since transcripts can be a few MB; the final assignment
-    // hops back to main so SwiftUI re-renders cleanly.
+    // event and publish updated context-window stats to nav. Runs off-main
+    // because it touches the disk at all; the final assignment hops back to
+    // main so SwiftUI re-renders cleanly.
     // Refresh transcript stats for every known claude session whose
     // sidecar gave us a sessionId. Triggered when meaningful SessionStore
     // state changes, so stats stay current without rereading transcripts
@@ -2336,7 +2347,7 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
                   let project = session.projectPath
             else { continue }
             let path = Self.transcriptPath(projectPath: project, sessionID: id)
-            DispatchQueue.global(qos: .utility).async { [weak self] in
+            Self.transcriptQueue.async { [weak self] in
                 guard let stats = TranscriptReader.read(path: path) else { return }
                 DispatchQueue.main.async {
                     self?.nav.claudeSessionStats[id] = stats
@@ -2353,7 +2364,7 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
             guard session.agent != "claude",
                   let ref = nav.transcriptRefByPID[session.pid]
             else { continue }
-            DispatchQueue.global(qos: .utility).async { [weak self] in
+            Self.transcriptQueue.async { [weak self] in
                 guard let stats = TranscriptReader.read(path: ref.path) else { return }
                 DispatchQueue.main.async {
                     self?.nav.claudeSessionStats[ref.sessionID] = stats
@@ -2374,7 +2385,7 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
             guard let id = session.claudeSessionID,
                   let project = session.projectPath
             else { continue }
-            DispatchQueue.global(qos: .utility).async { [weak self] in
+            Self.transcriptQueue.async { [weak self] in
                 guard let ref = PiTranscriptReader.locate(cwd: project),
                       let stats = TranscriptReader.read(path: ref.path)
                 else { return }
@@ -2394,6 +2405,28 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
         return "\(NSHomeDirectory())/.claude/projects/\(slug)/\(sessionID).jsonl"
     }
 
+    // Which model a handoff row should carry after a fresh reading.
+    //
+    // A nil reading means "I could not find the model", never "the model became
+    // nothing" — no agent can express the latter — so it must not erase what a
+    // previous Stop established. This matters because nil is now a routine
+    // outcome rather than a hypothetical one: a Codex rollout with no
+    // turn_context line has no model to find anywhere, and the model search is
+    // capped (CodexTranscriptReader.modelSearchBudget), so 40 of the rollouts
+    // on this machine (293 at the time of measuring) report nil on every read.
+    //
+    // Unlike `record.ticket` just above the call site, whose comment reasons
+    // that "nil is fine — the rollup re-derives from the branch at display",
+    // `record.model` has no fallback anywhere: Insights reads it directly
+    // (Insights.swift:165) and simply drops the row from the by-model
+    // breakdown, while the by-agent and by-bucket totals on the same screen
+    // still count it — so the two charts stop agreeing and nothing says why.
+    // Keeping the last known model IS the self-correcting answer here, because
+    // the next Stop that does find a turn_context overwrites it.
+    static func mergedModel(existing: String?, incoming: String?) -> String? {
+        incoming ?? existing
+    }
+
     private func refreshTranscriptStats(for event: NudgeEvent) {
         guard let sessionID = event.claudeSessionID,
               let path = event.transcriptPath, !path.isEmpty
@@ -2404,7 +2437,7 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
         if let pid = event.agentPID, pid > 0 {
             nav.transcriptRefByPID[pid] = TranscriptRef(sessionID: sessionID, path: path)
         }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        Self.transcriptQueue.async { [weak self] in
             guard let stats = TranscriptReader.read(path: path) else { return }
             DispatchQueue.main.async {
                 self?.nav.claudeSessionStats[sessionID] = stats
@@ -2461,7 +2494,8 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
                     // fine — the rollup re-derives from the branch at display.
                     record.ticket = ticket
                     if let stats {
-                        record.model = stats.model
+                        record.model = Self.mergedModel(existing: record.model,
+                                                        incoming: stats.model)
                         // Fold the reading into a running total so a compacted
                         // session reflects its real effort, not just the
                         // post-compaction remainder (see ContextTokens.fold).

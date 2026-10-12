@@ -30,31 +30,32 @@ enum PiTranscriptReader {
 
     private static let sessionsRoot = "\(NSHomeDirectory())/.pi/agent/sessions"
 
-    // Read the whole file and scan newest-first (same approach and tens-of-MB
-    // caveat as the Claude reader). First assistant message with a usage block
-    // wins. Returns nil for unreadable files or transcripts with no assistant
-    // turn yet.
-    static func read(path: String) -> TranscriptStats? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe),
-              let text = String(data: data, encoding: .utf8)
-        else { return nil }
+    // Scan the tail newest-first (same approach as the Claude reader; see
+    // TranscriptTail for why only the tail is read). First assistant message
+    // with a usage block wins. Returns nil for unreadable files or transcripts
+    // with no assistant turn yet.
+    static func read(path: String) -> TranscriptStats? { scan(path: path).stats }
 
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-        for line in lines.reversed() {
-            guard let lineData = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+    // As `read`, but also reporting whether the file could be read at all —
+    // TranscriptReader.cached needs the two apart to decide whether a nil is
+    // safe to memoise.
+    static func scan(path: String) -> (stats: TranscriptStats?, complete: Bool) {
+        var found: TranscriptStats?
+        let complete = TranscriptTail.scanLinesBackwards(path: path) { line in
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                   (obj["type"] as? String) == "message",
                   let message = obj["message"] as? [String: Any],
                   (message["role"] as? String) == "assistant",
                   let usage = message["usage"] as? [String: Any]
-            else { continue }
+            else { return false }
             let input      = intValue(usage["input"])
             let cacheRead  = intValue(usage["cacheRead"])
             let cacheWrite = intValue(usage["cacheWrite"])
-            let model = message["model"] as? String
-            return TranscriptStats(tokens: input + cacheRead + cacheWrite, model: model)
+            found = TranscriptStats(tokens: input + cacheRead + cacheWrite,
+                                    model: message["model"] as? String)
+            return true
         }
-        return nil
+        return (found, complete)
     }
 
     // Locate the active session file for a working directory. pi groups sessions
@@ -139,7 +140,14 @@ enum PiTranscriptReader {
     // {"type":"session","version":N,"id":"<uuid>","timestamp":"...","cwd":"..."}.
     // Read only a bounded prefix — the header is tiny and the file can be MB.
     private static func sessionHeader(path: String) -> (id: String, cwd: String)? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        // Through TranscriptTail's door, not FileHandle's: `locate` picks this
+        // path by mtime out of a sessions directory, so a FIFO named *.jsonl
+        // sitting there would block in open(2) forever — and this read happens
+        // BEFORE the reader is reached, so guarding only the reader left the
+        // hole open. Every transcript read shares one serial queue, so that
+        // would stall stats for every session.
+        guard let opened = TranscriptTail.openRegularFile(path) else { return nil }
+        let handle = opened.handle
         defer { try? handle.close() }
         let prefix = handle.readData(ofLength: 65536)
         // Parse only the first line's bytes. Decoding the whole 64 KiB prefix as

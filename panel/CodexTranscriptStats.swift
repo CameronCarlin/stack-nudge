@@ -16,29 +16,64 @@ import Foundation
 //     subset, not additive), so we must not sum them — the mistake that
 //     produces the well-known token-inflation bugs in third-party parsers.
 //
-// The active model is stamped on `turn_context` lines (and `session_meta`).
+// The active model is stamped on `turn_context` lines. `session_meta` does NOT
+// carry it — its payload has `model_provider`, not `model` — so a rollout with
+// no `turn_context` line has no model to find anywhere. Verified across the 293
+// rollouts on this machine: 40 of them resolve tokens with no model at all.
+// `turn_context` is emitted when the turn context changes (model, effort,
+// approval), not once per turn: a long interactive session has thousands, a
+// short one has exactly one near the head, and a `codex exec` run has none.
 enum CodexTranscriptReader {
 
-    // Read the whole file and scan newest-first, same approach (and same
-    // tens-of-MB caveat) as the Claude reader. The latest token_count gives
-    // current context occupancy; the latest model-bearing line gives the
-    // active model. Returns nil for unreadable files or rollouts with no
-    // token_count event yet.
-    static func read(path: String) -> TranscriptStats? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe),
-              let text = String(data: data, encoding: .utf8)
-        else { return nil }
+    // How deep to keep looking for the model once the tokens are in hand.
+    static let modelSearchBudget = 4 * 1024 * 1024
 
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+    // Scan the tail newest-first, same approach as the Claude reader. The
+    // latest token_count gives current context occupancy; the latest
+    // model-bearing line gives the active model. Returns nil for unreadable
+    // files or rollouts with no token_count event yet.
+    //
+    // Only the tail is read (see TranscriptTail for why), and the search for
+    // the model is capped separately and much lower than the search for the
+    // tokens. The two are found at very different depths: measured over the
+    // rollouts on this machine (293 at the time of measuring), tokens need at
+    // most 28 KB, while the model runs to 2.5 MB at worst (p50 21 KB,
+    // p99 1.9 MB) and on some rollouts is absent altogether. Past
+    // `modelSearchBudget` the tokens alone are enough; the model is left nil
+    // and Sessions omits the model clause.
+    //
+    // Three different counts live here and it is easy to quote the wrong one,
+    // so all three, bucketed by what `scan` actually returns:
+    //
+    //   226  tokens + model      deepest 2.47 MB, median 0.02 MB
+    //    40  tokens, no model    deepest 4.00 MB, median 2.40 MB   <- nil model
+    //    27  no tokens at all    deepest 0.16 MB, median 0.02 MB
+    //
+    // 54 rollouts have no model anywhere; 40 of those still resolve tokens and
+    // so return stats carrying a nil model, which is the number that matters
+    // to PanelController.mergedModel; and of those 40, **15** are the ones the
+    // budget actually stops — the other 25 reach the start of the file first.
+    // 15 is the count that justifies this cap existing, and before it those 15
+    // walked 8 MB on every read instead of 4.
+    //
+    // 4 MB clears every model depth observed with room to spare while halving
+    // the worst case. Tighten it with fresh measurements rather than by
+    // guessing — the only cost of it being too low is a missing model label.
+    static func read(path: String) -> TranscriptStats? { scan(path: path).stats }
 
+    // As `read`, but also reporting whether the file could be read at all —
+    // TranscriptReader.cached needs the two apart to decide whether a nil is
+    // safe to memoise.
+    static func scan(path: String) -> (stats: TranscriptStats?, complete: Bool) {
         var tokens: Int?
         var model: String?
 
-        for line in lines.reversed() {
-            if tokens != nil && model != nil { break }
-            guard let lineData = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
-            else { continue }
+        var depth = 0
+
+        let complete = TranscriptTail.scanLinesBackwards(path: path) { line in
+            depth += line.count + 1
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
+            else { return stop(tokens: tokens, model: model, depth: depth) }
 
             let payload = obj["payload"] as? [String: Any]
             let payloadType = (payload?["type"] as? String) ?? (obj["type"] as? String)
@@ -55,10 +90,20 @@ enum CodexTranscriptReader {
             if model == nil {
                 model = modelFrom(obj: obj, payload: payload)
             }
+            return stop(tokens: tokens, model: model, depth: depth)
         }
 
-        guard let tokens else { return nil }
-        return TranscriptStats(tokens: tokens, model: model)
+        guard let tokens else { return (nil, complete) }
+        return (TranscriptStats(tokens: tokens, model: model), complete)
+    }
+
+    // When to stop scanning: once the tokens are known, keep going only while
+    // the model might still turn up within its budget. Pure and exposed so the
+    // rule is testable without a rollout — it is the decision that governs how
+    // much of a 24 MB file gets read.
+    static func stop(tokens: Int?, model: String?, depth: Int) -> Bool {
+        guard tokens != nil else { return false }
+        return model != nil || depth > modelSearchBudget
     }
 
     // Locate the rollout file for a Codex session id. Codex's Stop hook may send
