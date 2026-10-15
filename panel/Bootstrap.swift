@@ -338,20 +338,31 @@ enum Bootstrap {
     // even after an explicit user Quit. Rewrite to the dict form that
     // restarts on crash only.
     private static func migrateKeepAliveIfNeeded(label: String) {
-        let fm = FileManager.default
+        guard crashOnlyKeepAliveOnDisk(label: label, agentsDir: launchAgentsDir) else { return }
         let plistPath = "\(launchAgentsDir)/\(label).plist"
-        guard fm.fileExists(atPath: plistPath),
-              let data = try? Data(contentsOf: URL(fileURLWithPath: plistPath)),
-              var plist = (try? PropertyListSerialization.propertyList(
-                  from: data, options: [], format: nil)) as? [String: Any]
-        else { return }
-        guard (plist["KeepAlive"] as? Bool) == true else { return }
-        plist["KeepAlive"] = ["SuccessfulExit": false]
-        guard let updated = try? PropertyListSerialization.data(
-            fromPropertyList: plist, format: .xml, options: 0) else { return }
-        try? updated.write(to: URL(fileURLWithPath: plistPath), options: [.atomic])
         _ = try? runLaunchctl(["unload", plistPath])
         _ = try? runLaunchctl(["load",   plistPath])
+    }
+
+    // The disk half of migrateKeepAliveIfNeeded, split out so the updater can
+    // apply it without the reload. Returns whether it changed anything.
+    //
+    // Panel agent only — the daemon's `KeepAlive: true` is deliberate.
+    @discardableResult
+    static func crashOnlyKeepAliveOnDisk(label: String,
+                                         agentsDir: String) -> Bool {
+        let plistPath = "\(agentsDir)/\(label).plist"
+        guard let data = FileManager.default.contents(atPath: plistPath),
+              var plist = (try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil)) as? [String: Any],
+              (plist["KeepAlive"] as? Bool) == true
+        else { return false }
+        plist["KeepAlive"] = ["SuccessfulExit": false]
+        guard let updated = try? PropertyListSerialization.data(
+                  fromPropertyList: plist, format: .xml, options: 0),
+              (try? updated.write(to: URL(fileURLWithPath: plistPath), options: [.atomic])) != nil
+        else { return false }
+        return true
     }
 
     // Read the on-disk launchd plist for `label`; if its first program-
@@ -379,6 +390,214 @@ enum Bootstrap {
         try? updated.write(to: URL(fileURLWithPath: plistPath), options: [.atomic])
         _ = try? runLaunchctl(["unload", plistPath])
         _ = try? runLaunchctl(["load", plistPath])
+    }
+
+    // MARK: - Retarget on update
+
+    // The launch agents record absolute paths into whichever bundle ran the
+    // setup wizard (writePanelPlist uses Bundle.main), and nothing on the
+    // update path used to correct them. Two ways that goes wrong:
+    //
+    //   - A pre-1.7 user. The v1.6 updater installed into `stack-nudge.app`
+    //     whatever .app it extracted, so modern code has been running from
+    //     the old-named folder ever since, and migrateBundleNameIfNeeded
+    //     (gated on running from `StackNudge.app`) never fires for them.
+    //   - The wizard run from a copy that later moves or is deleted, e.g. an
+    //     extracted tarball in ~/Downloads.
+    //
+    // Either way the plist points somewhere the update never touches. At
+    // best launchd keeps starting the old version at login; at worst the
+    // program is gone and `kickstart` never returns, which is #205.
+    //
+    // The rule: a path inside some `.app` bundle that is NOT `installed` is
+    // re-pointed at the same location inside `installed` — but only if that
+    // file exists there. A path into a bundle that no longer contains it is
+    // left alone rather than swapped for a second missing path. Pure, so the
+    // rule is testable without a plist or a filesystem.
+    //
+    // `isSuperseded` decides whether the bundle a path currently points into
+    // is one the update should move it AWAY from. Without it, a developer
+    // whose plist deliberately points at `build/StackNudge.app` would be
+    // silently re-pointed at the release on their next in-app update. See
+    // bundleIsSuperseded for the production rule.
+    static func retargetedBundlePath(_ path: String,
+                                     toBundle installed: String,
+                                     exists: (String) -> Bool,
+                                     isSuperseded: (String) -> Bool) -> String? {
+        // The OUTERMOST bundle: a path into a helper nested inside the app
+        // belongs to the app.
+        guard let marker = path.range(of: ".app/") else { return nil }
+        let root = (String(path[..<marker.lowerBound]) + ".app" as NSString).standardizingPath
+        let target = (installed as NSString).standardizingPath
+        guard root != target, !sameDirectory(root, target) else { return nil }
+        // Only OUR bundles, under any name they have shipped or been saved
+        // as: `StackNudge.app`, the pre-1.7 `stack-nudge.app`, and Finder's
+        // duplicate-download `StackNudge 2.app`. Existence alone isn't a
+        // guard here, because directories pass it: another app's
+        // `Contents/Resources` exists inside ours too, so without this a
+        // path into a foreign app would be re-pointed into stack-nudge.
+        let name = (root as NSString).lastPathComponent.lowercased()
+        guard name.hasPrefix("stacknudge") || name.hasPrefix("stack-nudge") else { return nil }
+        guard isSuperseded(root) else { return nil }
+        let candidate = target + "/" + String(path[marker.upperBound...])
+        return exists(candidate) ? candidate : nil
+    }
+
+    // Whether two paths name the same directory on disk, by device and inode.
+    // standardizingPath compares spelling, not identity: it doesn't resolve
+    // a symlinked parent, and APFS is case-insensitive by default, so the
+    // installed bundle reached by another spelling would otherwise look like
+    // a different bundle and trigger a spurious retarget — skipping the app
+    // kickstart and retiring a perfectly good job. False when either path is
+    // missing, which is the case retargeting exists for.
+    static func sameDirectory(_ a: String, _ b: String) -> Bool {
+        var sa = stat(), sb = stat()
+        guard stat(a, &sa) == 0, stat(b, &sb) == 0 else { return false }
+        return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino
+    }
+
+    // Applies retargetedBundlePath to a plist's ProgramArguments and its
+    // EnvironmentVariables — the daemon's ESPEAK_DATA_PATH points into the
+    // bundle too, and a corrected binary reading a stale data dir is the
+    // same bug one level down. Nil when nothing would change.
+    static func retargetedLaunchSpec(arguments: [String],
+                                     environment: [String: String],
+                                     toBundle installed: String,
+                                     exists: (String) -> Bool,
+                                     isSuperseded: (String) -> Bool)
+        -> (arguments: [String], environment: [String: String])? {
+        var changed = false
+        let arguments = arguments.map { argument -> String in
+            guard let moved = retargetedBundlePath(argument, toBundle: installed, exists: exists,
+                                                   isSuperseded: isSuperseded)
+            else { return argument }
+            changed = true
+            return moved
+        }
+        var environment = environment
+        for (key, value) in environment {
+            if let moved = retargetedBundlePath(value, toBundle: installed, exists: exists,
+                                                isSuperseded: isSuperseded) {
+                environment[key] = moved
+                changed = true
+            }
+        }
+        return changed ? (arguments, environment) : nil
+    }
+
+    // Rewrite one agent's plist on disk to point into `installed`. Returns
+    // whether it changed anything.
+    //
+    // Disk only — deliberately no reload. The caller is the updater, which
+    // may itself be the process this agent launched, and how to treat the
+    // stale loaded copy is the caller's decision (see
+    // Updater.restartSequence for why it retires the job rather than
+    // reloading it). The file is what launchd reads at next login.
+    @discardableResult
+    static func retargetLaunchAgentOnDisk(label: String,
+                                          toBundle installed: String,
+                                          agentsDir: String) -> Bool {
+        let plistPath = "\(agentsDir)/\(label).plist"
+        guard let data = FileManager.default.contents(atPath: plistPath),
+              var plist = (try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil)) as? [String: Any],
+              let arguments = plist["ProgramArguments"] as? [String]
+        else { return false }
+        let environment = plist["EnvironmentVariables"] as? [String: String] ?? [:]
+
+        guard let spec = retargetedLaunchSpec(
+            arguments: arguments, environment: environment, toBundle: installed,
+            exists: { FileManager.default.fileExists(atPath: $0) },
+            isSuperseded: { bundleIsSuperseded($0, by: installed) })
+        else { return false }
+
+        plist["ProgramArguments"] = spec.arguments
+        if !spec.environment.isEmpty {
+            plist["EnvironmentVariables"] = spec.environment
+        }
+        guard let updated = try? PropertyListSerialization.data(
+                  fromPropertyList: plist, format: .xml, options: 0),
+              (try? updated.write(to: URL(fileURLWithPath: plistPath), options: [.atomic])) != nil
+        else { return false }
+        return true
+    }
+
+    // Whether an update should move a launch agent away from `root`:
+    //
+    //   - it no longer exists (the ~/Downloads copy that was deleted),
+    //   - it is the pre-1.7 `stack-nudge.app`, or
+    //   - its version is older than the bundle just installed (a stale
+    //     ~/Downloads or /Applications copy).
+    //
+    // A current developer build is none of these. It carries the
+    // release-please version, so it is never older than the release that
+    // was just installed unless the checkout is behind, and then it IS
+    // stale. A bundle whose version can't be read counts as superseded: it
+    // can't be confirmed current, and a damaged bundle is a worse thing to
+    // keep pointing at than the one that was just installed.
+    static func bundleIsSuperseded(_ root: String, by installed: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: root) else { return true }
+        if (root as NSString).lastPathComponent.lowercased() == "stack-nudge.app" { return true }
+        guard let rootVersion = bundleVersion(root),
+              let installedVersion = bundleVersion(installed)
+        else { return true }
+        return UpdateChecker.isNewer(installedVersion, than: rootVersion)
+    }
+
+    static func bundleVersion(_ bundle: String) -> String? {
+        let info = URL(fileURLWithPath: bundle).appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: info),
+              let plist = (try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil)) as? [String: Any]
+        else { return nil }
+        return plist["CFBundleShortVersionString"] as? String
+    }
+
+    // The `~/.stack-nudge/venv` symlink has the plists' problem one level
+    // down: linkBundledVenvIfPresent points it into whichever bundle ran the
+    // wizard, and notify.sh and Speaker reach the voice engine through it.
+    // Same rule, applied to the link's destination. Replaced atomically, by
+    // renaming a fresh link over it, so a reader never finds no link at all.
+    @discardableResult
+    static func retargetVenvSymlink(toBundle installed: String, symlinkPath: String) -> Bool {
+        let fm = FileManager.default
+        guard let destination = try? fm.destinationOfSymbolicLink(atPath: symlinkPath),
+              let moved = retargetedBundlePath(
+                  destination, toBundle: installed,
+                  exists: { fm.fileExists(atPath: $0) },
+                  isSuperseded: { bundleIsSuperseded($0, by: installed) })
+        else { return false }
+        let staging = symlinkPath + ".retarget-\(getpid())"
+        try? fm.removeItem(atPath: staging)
+        guard (try? fm.createSymbolicLink(atPath: staging, withDestinationPath: moved)) != nil
+        else { return false }
+        guard rename(staging, symlinkPath) == 0 else {
+            try? fm.removeItem(atPath: staging)
+            return false
+        }
+        return true
+    }
+
+    // Everything the updater does to the launch agents on disk, in one
+    // testable place: re-point both, and bring the app agent's KeepAlive up
+    // to crash-only (see Updater for why). Returns the labels re-pointed.
+    //
+    // App only for KeepAlive — the daemon's `KeepAlive: true` is deliberate.
+    static func retargetAgentsAfterUpdate(toBundle installed: String,
+                                          agentsDir: String,
+                                          venvSymlinkPath: String) -> Set<String> {
+        // Not in the returned set: the set drives launchd handling, and the
+        // symlink involves none.
+        retargetVenvSymlink(toBundle: installed, symlinkPath: venvSymlinkPath)
+        var retargeted: Set<String> = []
+        for label in [appLabel, daemonLabel]
+        where retargetLaunchAgentOnDisk(label: label, toBundle: installed, agentsDir: agentsDir) {
+            retargeted.insert(label)
+        }
+        if retargeted.contains(appLabel) {
+            crashOnlyKeepAliveOnDisk(label: appLabel, agentsDir: agentsDir)
+        }
+        return retargeted
     }
 
     // Agents present on this Mac. The bootstrap wizard checks all of these
