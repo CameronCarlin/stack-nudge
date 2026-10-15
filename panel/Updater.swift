@@ -206,12 +206,66 @@ final class Updater {
         //    than ~/Applications/ (e.g. a dev build still in the picture).
         //    Without the explicit launch, kickstart silently fails and
         //    the auto-quit kills the panel with nothing to restart it.
-        setPhase(.done)
-        appendLog("Restarting…")
-        try kickstartLaunchd()
-        restartDaemon()          // pick up the stackvox engine the swap just installed
-        relaunchInstalledBundle()
-        scheduleAutoQuit()
+        //
+        //    The two kickstarts are best-effort and bounded (see runBounded).
+        //    They must not be able to gate the two calls below them, which
+        //    are what actually restarts stack-nudge: in #205 an unbounded
+        //    kickstart sat here forever and the panel never relaunched, never
+        //    quit, and sat on "Restarting stack-nudge…" until the user
+        //    quit it by hand. Nothing on this path throws for the same
+        //    reason — a thrown error would route to fail() and strand the
+        //    user on the progress screen with the new bundle already on disk.
+        Self.restartSequence(
+            announce: { [weak self] in
+                self?.setPhase(.done)
+                self?.appendLog("Restarting…")
+            },
+            kickstart: { [weak self] label in
+                self?.kickstartLaunchd(label) ?? .failedToStart("updater went away")
+            },
+            relaunch: { [weak self] in self?.relaunchInstalledBundle() },
+            quit:     { [weak self] in self?.scheduleAutoQuit() })
+    }
+
+    // The restart, with its side effects injected.
+    //
+    // This exists as a seam for one assertion: `relaunch` and `quit` run
+    // whatever the kickstarts return. That is the whole of #205 — a kickstart
+    // sat in front of those two calls and never came back — and without a
+    // seam the only thing protecting it is a comment. A refactor that gates
+    // the relaunch on `.exited(0)`, or routes a `.timedOut` through `fail()`,
+    // reproduces the bug exactly while every other test stays green.
+    //
+    // On the order, since the obvious question is why the best-effort kicks
+    // go first. The original answer given here was that relaunching first
+    // would cut the daemon kickstart short and lose #124 — that was wrong,
+    // and measurement killed it: launchd owns the respawn, so a kickstart
+    // interrupted at 10ms still restarts its job. Nor does the order protect
+    // #124 anyway, because a *successful* app-label `kickstart -k` kills
+    // this process before the daemon line is ever reached.
+    //
+    // What survives is smaller and honest: relaunching first would mean a
+    // `createsNewApplicationInstance` launch AND a launchd respawn of the
+    // same app, briefly putting three icons in the menu bar. With the
+    // timeout at 2s that trade buys at most ~4s, so it isn't worth a visible
+    // glitch — but if these calls ever grow teeth again, reorder rather than
+    // re-deriving the old reason.
+    //
+    // The daemon kick itself is #124: a long-running `stackvox serve` job
+    // that otherwise keeps running the pre-update engine until next login.
+    // `announce` is inside the seam on purpose. With the phase/log lines left
+    // at the call site, a throwing call inserted between them and this
+    // function would reproduce #205 while the test below stayed green —
+    // the seam only protects what it actually contains.
+    static func restartSequence(announce: () -> Void,
+                                kickstart: (String) -> LaunchctlOutcome,
+                                relaunch: () -> Void,
+                                quit: () -> Void) {
+        announce()
+        _ = kickstart(Bootstrap.appLabel)
+        _ = kickstart(Bootstrap.daemonLabel)   // pick up the engine the swap installed
+        relaunch()
+        quit()
     }
 
     private func relaunchInstalledBundle() {
@@ -405,18 +459,33 @@ final class Updater {
 
     private func extractTarball(_ tarballURL: URL) throws -> URL {
         let workDir = tarballURL.deletingLastPathComponent()
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        task.arguments = ["-xzf", tarballURL.path, "-C", workDir.path]
-        task.standardOutput = Pipe()
-        let errPipe = Pipe()
-        task.standardError = errPipe
-        try task.run()
-        task.waitUntilExit()
-        if task.terminationStatus != 0 {
-            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),
-                             encoding: .utf8) ?? ""
-            throw UpdateError.extractFailed(stderr: err)
+        // stderr goes to a file, not a Pipe read after waitUntilExit() — that
+        // ordering is the textbook deadlock: a tar chatty enough to fill the
+        // pipe buffer blocks on write() before we ever reach the read, and
+        // the panel hangs on "Extracting…". A file has no such buffer, and we
+        // still get the text for the error message.
+        let errLog = workDir.appendingPathComponent("tar-stderr.log")
+        FileManager.default.createFile(atPath: errLog.path, contents: nil)
+        let errHandle = try FileHandle(forWritingTo: errLog)
+        let outcome = Self.runBounded("/usr/bin/tar",
+                                      ["-xzf", tarballURL.path, "-C", workDir.path],
+                                      timeout: Self.extractTimeout,
+                                      standardError: errHandle)
+        try? errHandle.close()
+        let stderrText = (try? String(contentsOf: errLog, encoding: .utf8)) ?? ""
+        switch outcome {
+        case .exited(0):
+            break
+        case .exited:
+            throw UpdateError.extractFailed(stderr: stderrText)
+        case .killedBySignal(let signal):
+            throw UpdateError.extractFailed(
+                stderr: "tar killed by signal \(signal). \(stderrText)")
+        case .timedOut:
+            throw UpdateError.extractFailed(
+                stderr: "tar timed out after \(Int(Self.extractTimeout))s. \(stderrText)")
+        case .failedToStart(let message):
+            throw UpdateError.extractFailed(stderr: message)
         }
         // Find the extracted .app — tarball wraps StackNudge.app at the top level.
         let contents = try FileManager.default
@@ -429,15 +498,23 @@ final class Updater {
     }
 
     private func stripQuarantine(at url: URL) throws {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-        task.arguments = ["-dr", "com.apple.quarantine", url.path]
-        task.standardOutput = Pipe()
-        task.standardError = Pipe()
-        try task.run()
-        task.waitUntilExit()
+        // Bounded, and through /dev/null rather than a Pipe nobody reads.
+        // `xattr -dr` walks a freshly extracted ~200MB bundle and prints a
+        // line per failure; once that filled the pipe buffer the child
+        // blocked on write() while we blocked on it, and the panel hung on
+        // "Installing…" — worse than the hang this PR is named for, because
+        // this runs BEFORE writeStatusFile, so there is no success marker
+        // and no relaunch to recover with.
+        let outcome = Self.runBounded("/usr/bin/xattr",
+                                      ["-dr", "com.apple.quarantine", url.path],
+                                      timeout: Self.quarantineTimeout)
         // Ignore exit status — xattr -d is "success" even when the attr
         // wasn't set on macOS. Non-zero may be benign.
+        if case .timedOut = outcome {
+            // Not fatal: quarantine left on means Gatekeeper may prompt on
+            // first launch, which is a worse first run, not a broken one.
+            appendLog("xattr timed out after \(Int(Self.quarantineTimeout))s (non-fatal)")
+        }
     }
 
     static let installedAppPath = "\(NSHomeDirectory())/Applications/StackNudge.app"
@@ -487,38 +564,160 @@ final class Updater {
 
     // MARK: - Launchd
 
-    private func kickstartLaunchd(_ label: String = Bootstrap.appLabel) throws {
-        let uid = getuid()
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        task.arguments = ["kickstart", "-k",
-                          "gui/\(uid)/\(label)"]
-        task.standardOutput = Pipe()
-        task.standardError = Pipe()
-        try task.run()
-        task.waitUntilExit()
-        if task.terminationStatus != 0 {
-            // Not fatal — the kickstart can fail if the agent isn't loaded
-            // (e.g. fresh dev install). The new bundle is in place; user
-            // can hit the hotkey to launch it manually next time.
-            appendLog("launchctl kickstart \(label) exited \(task.terminationStatus) (non-fatal)")
-        }
+    // How long a best-effort launchctl call may hold up the restart.
+    //
+    // Two seconds, because the wait buys nothing. launchd owns the respawn,
+    // not launchctl: SIGTERM a `kickstart -k` 10ms in and the job is still
+    // killed and still comes back — measured, the job sat in "spawn
+    // scheduled" and respawned on its own at t≈10s with a fresh pid.
+    // So abandoning the wait abandons only the reporting, never the restart.
+    //
+    // Ten was the first number here, and it was the worst of both: a
+    // crash-looping job's respawn throttle straddles it (measured 10.2s,
+    // 11.6s, 20.0s, 20.0s across consecutive runs), so a 10s timeout would
+    // fire routinely on jobs that were recovering normally — turning this
+    // PR's one new diagnostic into a false alarm — while still being long
+    // enough for a user to sit through twice.
+    static let kickstartTimeout: TimeInterval = 2
+
+    // Extraction and the quarantine walk are over a ~200MB bundle on an
+    // arbitrary disk, so these are generous: they exist to catch a wedged
+    // child, not to police a slow one.
+    static let extractTimeout: TimeInterval = 300
+    static let quarantineTimeout: TimeInterval = 120
+
+    // Grace given to SIGTERM before SIGKILL, and again to SIGKILL before we
+    // give up waiting for the reap. Both are paid only by a child that
+    // ignores SIGTERM — a wedged `launchctl` dies on it immediately
+    // (measured), so in practice a bounded call costs its timeout.
+    static let terminateGrace: TimeInterval = 2
+
+    // The true worst case for ONE bounded call: the timeout, plus both
+    // grace periods. Named because the obvious arithmetic (just the
+    // timeout) understates it, and a budget assertion that uses the
+    // obvious number is measuring something that isn't the budget.
+    static var boundedCallCeiling: TimeInterval { kickstartTimeout + terminateGrace * 2 }
+
+    // Outcome of a bounded subprocess run. `.timedOut` is the case that
+    // matters here: it is precisely the one the old unbounded
+    // `waitUntilExit()` could not report, because it never returned to
+    // report anything.
+    enum LaunchctlOutcome: Equatable {
+        case exited(Int32)
+        case killedBySignal(Int32)
+        case timedOut
+        case failedToStart(String)
     }
 
-    /// Restart the stackvox TTS daemon so it re-execs the engine the atomic
-    /// swap just placed on disk. The daemon is a long-running `stackvox serve`
-    /// launchd job; without an explicit kickstart it keeps running the
-    /// pre-update engine until the next login or crash, so engine fixes
-    /// (streaming playback, pronunciation, …) silently don't take effect after
-    /// an app update. Non-fatal: launchd KeepAlive brings it back on next login
-    /// regardless, and shell installs that never registered the daemon agent
-    /// simply get a harmless "not loaded" kickstart.
-    private func restartDaemon() {
+    // Run a subprocess and give up on it after `timeout`.
+    //
+    // `launchctl kickstart -k` blocks for as long as launchd takes to respawn
+    // the job, and when the job's program is missing that is forever.
+    // Measured against throwaway agents, and replicated on a second machine:
+    //
+    //     healthy, long-running      rc 0    0.05s
+    //     label not loaded           rc 113  0.03s
+    //     ProgramArguments[0] gone   —       never returns ("spawn scheduled")
+    //
+    // Issue #205 is what that costs: the panel sat on "Restarting
+    // stack-nudge…" forever, because the updater thread never reached the
+    // lines that relaunch and quit it.
+    //
+    // Why we can reach that state at all: the voice daemon's plist points at
+    // a path *inside the app bundle* (Bootstrap.swift), atomicSwap replaces
+    // that bundle wholesale, and the plist is written at install time and
+    // never revalidated against the new one.
+    //
+    // What does NOT cause it, so nobody re-derives it from this comment: a
+    // release that ships without the venv. release.yml sets
+    // STACKNUDGE_BUNDLE_VENV=1 at job level over both matrix arches, build.sh
+    // runs under `set -e`, and ProgramArguments[0] is the venv's python3 —
+    // the one file present in any bundle that has a venv at all. Which path
+    // was actually missing on the reporting machine is not established and
+    // cannot be from the evidence: a hang logged nothing. Hence the timeout
+    // below logs the case that used to be silent.
+    //
+    // Output goes to /dev/null rather than a Pipe nobody drains, so a chatty
+    // child cannot fill a pipe buffer and deadlock instead.
+    //
+    // Static and internal so the timeout path is testable without launchd.
+    static func runBounded(_ executable: String,
+                           _ args: [String],
+                           timeout: TimeInterval,
+                           standardError: Any? = nil) -> LaunchctlOutcome {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = args
+        task.standardOutput = FileHandle.nullDevice
+        // A caller that needs the text passes a FileHandle on a real file.
+        // Never a Pipe: an undrained one is the deadlock this helper exists
+        // to avoid, and draining it correctly means reading before the wait.
+        task.standardError = standardError ?? FileHandle.nullDevice
+
+        let finished = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in finished.signal() }
         do {
-            try kickstartLaunchd(Bootstrap.daemonLabel)
+            try task.run()
         } catch {
-            appendLog("daemon kickstart failed: \(error) (non-fatal)")
+            return .failedToStart(error.localizedDescription)
         }
+        guard finished.wait(timeout: .now() + timeout) == .success else {
+            // SIGTERM first; SIGKILL if it is wedged badly enough to ignore
+            // it, so we never leave the child behind holding the work the
+            // timeout was supposed to abandon.
+            task.terminate()
+            if finished.wait(timeout: .now() + Self.terminateGrace) != .success {
+                // Guarded, because this is a raw syscall against a number.
+                // Foundation reaps the child before it invokes the
+                // termination handler, so between the reap and our wait
+                // expiring the pid is free and the kernel may already have
+                // handed it to someone else — an unguarded kill would land
+                // on an unrelated process of the user's.
+                if task.isRunning { kill(task.processIdentifier, SIGKILL) }
+                // Wait again so we return with the child reaped rather than
+                // a zombie: on the restart path we quit moments later, and
+                // orphaning a launchctl mid-kickstart is how this file got
+                // its reputation.
+                _ = finished.wait(timeout: .now() + Self.terminateGrace)
+            }
+            return .timedOut
+        }
+        // Foundation puts the SIGNAL number in terminationStatus when the
+        // child was killed, so reporting it as an exit code turns a launchctl
+        // killed by SIGSEGV into "exited 11" in the one log the user reads.
+        if task.terminationReason == .uncaughtSignal {
+            return .killedBySignal(task.terminationStatus)
+        }
+        return .exited(task.terminationStatus)
+    }
+
+    // Best-effort, and bounded. Never throws: every caller is on the restart
+    // path, where the only thing worse than a failed kickstart is one that
+    // prevents the relaunch from happening at all.
+    @discardableResult
+    private func kickstartLaunchd(_ label: String = Bootstrap.appLabel) -> LaunchctlOutcome {
+        let outcome = Self.runBounded(
+            "/bin/launchctl",
+            ["kickstart", "-k", "gui/\(getuid())/\(label)"],
+            timeout: Self.kickstartTimeout)
+        switch outcome {
+        case .exited(0):
+            break
+        case .exited(let status):
+            // Expected when the agent isn't loaded (fresh dev install, or a
+            // shell install that never registered it) — launchctl exits 113.
+            // The new bundle is on disk either way.
+            appendLog("launchctl kickstart \(label) exited \(status) (non-fatal)")
+        case .killedBySignal(let signal):
+            appendLog("launchctl kickstart \(label) killed by signal \(signal) (non-fatal)")
+        case .timedOut:
+            // Not a warning: launchd continues the respawn without us.
+            appendLog("launchctl kickstart \(label) still working after "
+                      + "\(Int(Self.kickstartTimeout))s; left to launchd")
+        case .failedToStart(let message):
+            appendLog("launchctl kickstart \(label) could not start: \(message) (non-fatal)")
+        }
+        return outcome
     }
 
     // MARK: - Status file
