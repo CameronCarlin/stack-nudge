@@ -1208,7 +1208,13 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
         // resets Codex's hook-trust hash (Codex silently skips a changed hook
         // until re-trusted, and there's no trust API for us to call), so when one
         // happens and Codex is wired, nudge the user to re-trust via /hooks.
-        if Bootstrap.refreshNotifyScriptIfNeeded() != nil,
+        // The same drift, for the hooks themselves: wired agents are brought in
+        // line with this version's hook-manifest.json (new events added, dropped ones
+        // removed, our commands repointed to the current path and arg). Codex wants a re-trust after either: a changed
+        // notify.sh, or a changed entry in its hooks.json.
+        let scriptRefreshed = Bootstrap.refreshNotifyScriptIfNeeded() != nil
+        let rewired = Bootstrap.reconcileWiredAgents()
+        if scriptRefreshed || rewired.contains(.codex),
            FileManager.default.fileExists(atPath: "\(NSHomeDirectory())/.codex/hooks.json") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
                 self?.postCodexRetrustBanner()
@@ -2802,7 +2808,7 @@ final class PanelController: NSObject, NSApplicationDelegate, PanelKeyDelegate,
     private func postCodexRetrustBanner() {
         let content = UNMutableNotificationContent()
         content.title = "Codex hooks need re-trusting"
-        content.body = "This update changed notify.sh. Run /hooks in Codex to re-trust its hooks, or Codex sessions won't be captured."
+        content.body = "This update changed StackNudge's Codex hooks. Run /hooks in Codex to re-trust its hooks, or Codex sessions won't be captured."
         content.categoryIdentifier = "STOP"
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)

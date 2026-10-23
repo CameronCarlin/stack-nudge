@@ -10,11 +10,24 @@
 #
 # Usage: notify.sh <agent> <event>
 #   agent: claude-code | cursor | gemini | codex | <any name>
-#   event: stop | permission
+#   event: stop | permission | welcome (install.sh's first-run greeting)
+#   Any other event exits without doing anything (see below).
 # Example: notify.sh claude-code stop
 
 AGENT="${1:-agent}"
-EVENT="${2:-stop}"
+# Lowercased (tr, not ${2,,}: macOS ships bash 3.2), so a hook wired by hand
+# with the agent's own event name, `notify.sh claude-code Stop` or
+# `… PermissionRequest`, still works.
+EVENT="$(printf '%s' "${2:-stop}" | tr '[:upper:]' '[:lower:]')"
+[[ "$EVENT" == "permissionrequest" ]] && EVENT=permission
+
+# An event this version doesn't know is a no-op. Hooks can outlive the script
+# that handles them (a downgrade, a config from a newer install), and falling
+# through to the stop banner would nudge on every such event.
+case "$EVENT" in
+  stop|permission|welcome) ;;
+  *) exit 0 ;;
+esac
 OS="$(uname -s 2>/dev/null || echo Windows)"
 
 # Load user config (overrides defaults below). Parse as KEY=VALUE data only —

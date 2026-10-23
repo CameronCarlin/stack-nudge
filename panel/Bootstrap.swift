@@ -79,6 +79,9 @@ enum Bootstrap {
     static let configPath       = "\(NSHomeDirectory())/.stack-nudge/config"
     static let phrasesDir       = "\(NSHomeDirectory())/.stack-nudge/phrases"
     static let userQuitMarker   = "\(NSHomeDirectory())/.stack-nudge/user-quit"
+    // Which manifest events have been reconciled into each agent, so a hook the
+    // user deleted by hand isn't put back on the next launch.
+    static let hooksAppliedPath = "\(NSHomeDirectory())/.stack-nudge/hooks-applied.json"
 
     static let launchAgentsDir  = "\(NSHomeDirectory())/Library/LaunchAgents"
     static let appLabel         = "com.stackonehq.stack-nudge"
@@ -652,9 +655,8 @@ enum Bootstrap {
     // Wire a single agent — used by the reconciliation row's "Set up"
     // action. Same per-agent dispatch as install(agents:) does in its
     // loop, just exposed for one-at-a-time wiring without re-running
-    // the full bootstrap. Idempotent: calling on an already-wired agent
-    // adds another entry (existing entries are detected by the next
-    // unwiredAgents() refresh).
+    // the full bootstrap. Idempotent: our existing entries are replaced, not
+    // duplicated.
     static func wireSingleAgent(_ agent: BootstrapAgent) throws {
         try wireHooks(for: agent)
     }
@@ -749,12 +751,31 @@ enum Bootstrap {
         }
 
         progress("Removing hook entries…")
+        let manifest = HookManifest.bundled()
+        var unwritable: [String] = []
         for agent in BootstrapAgent.allCases {
             let path = agent.hookConfigPath
-            if fm.fileExists(atPath: path) {
-                try unwireHooks(at: path)
+            guard fm.fileExists(atPath: path) else { continue }
+            // An unreadable config (not JSON, or not an object) is skipped: there's
+            // nothing in it we could safely strip, and it can't fire our hooks.
+            let root: [String: Any]
+            do {
+                root = try readJSONObject(at: path)
+            } catch {
+                progress("Skipped \((path as NSString).abbreviatingWithTildeInPath): \(error.localizedDescription)")
+                continue
+            }
+            // A readable config we failed to rewrite (root-owned after a sudo
+            // run, locked) still points at notify.sh, so finish the other agents
+            // but stop before deleting the script, and say how to get past it.
+            do {
+                try unwireHooks(root, at: path, agent: agent, spec: manifest?.agents[agent])
+            } catch {
+                progress("Couldn't update \((path as NSString).abbreviatingWithTildeInPath): \(error.localizedDescription)")
+                unwritable.append((path as NSString).abbreviatingWithTildeInPath)
             }
         }
+        if !unwritable.isEmpty { throw BootstrapError.hooksNotRemoved(unwritable) }
 
         progress("Removing \(installDir)…")
         try? fm.removeItem(atPath: installDir)
@@ -824,128 +845,112 @@ enum Bootstrap {
 
     // MARK: - Hook wiring (per-agent)
 
-    // Splice our hook entry into the agent's JSON config, after removing
-    // any stale entries pointing at older tinynudge/stack-nudge installs.
-    // Swift port of the inline-Python blocks in install.sh.
+    // Put every hook the manifest lists for `agent` in place: the wizard and
+    // the Settings "Set up" action. Replaces our entries under the manifest's
+    // events (older paths, args, timeouts, matchers) with exactly the manifest's,
+    // removes ones it dropped, and leaves everyone else's alone.
     private static func wireHooks(for agent: BootstrapAgent) throws {
-        let path = agent.hookConfigPath
-        switch agent {
-        case .claude:
-            // Stop (30s) + PermissionRequest (600s); Claude's
-            // matcher-group JSON shape.
-            try wireClaudeShapedHooks(at: path, agentArg: "claude-code",
-                                      events: [("Stop",              "stop",       30),
-                                               ("PermissionRequest", "permission", 600)])
-        case .cursor:
-            try wireCursorHooks(at: path)
-        case .codex:
-            // Codex's hooks file is structurally identical to Claude's
-            // (matcher-groups), with the same event names. Only the
-            // file path and the agent-arg differ.
-            try wireClaudeShapedHooks(at: path, agentArg: "codex",
-                                      events: [("Stop",              "stop",       30),
-                                               ("PermissionRequest", "permission", 600)])
-        case .gemini:
-            // Gemini renames Claude's `Stop` to `AfterAgent` and routes
-            // tool-permission prompts through `Notification` (with
-            // `notification_type=ToolPermission` on stdin). Same
-            // matcher-group JSON shape otherwise.
-            //
-            // CRITICAL DIFFERENCE FROM CLAUDE/CODEX: Gemini's `timeout`
-            // is measured in **milliseconds**, not seconds. Sending 30
-            // would kill the hook after 30 ms — before the shell even
-            // forks. Multiply by 1000 to match the writer's
-            // milliseconds-only convention for Gemini.
-            //
-            // Note: Notification is observability-only — our hook can
-            // surface the banner but can't return an allow/deny
-            // decision the way Claude's PermissionRequest can.
-            try wireClaudeShapedHooks(at: path, agentArg: "gemini",
-                                      events: [("AfterAgent",   "stop",       30_000),
-                                               ("Notification", "permission", 30_000)])
-        case .antigravity:
-            // Antigravity CLI uses the same hook events and millisecond timeout conventions as Gemini.
-            try wireClaudeShapedHooks(at: path, agentArg: "antigravity",
-                                      events: [("AfterAgent",   "stop",       30_000),
-                                               ("Notification", "permission", 30_000)])
-        }
+        guard let manifest = HookManifest.bundled() else { throw BootstrapError.bundleResourceMissing("hook-manifest.json") }
+        try reconcileHooks(for: agent, manifest: manifest, everything: true)
     }
 
-    // Generic writer for the matcher-group JSON shape that Claude,
-    // Codex, and Gemini all use. Differs from agent to agent only in
-    // file path, agent-arg passed to notify.sh, and the set of event
-    // names. Cursor uses a flat-array shape and has its own writer.
-    private static func wireClaudeShapedHooks(
-        at path: String,
-        agentArg: String,
-        events: [(event: String, arg: String, timeout: Int)]
-    ) throws {
-        var root = try readJSONObject(at: path)
-        var hooks = root["hooks"] as? [String: Any] ?? [:]
-
-        for (event, arg, timeout) in events {
-            var groups = hooks[event] as? [[String: Any]] ?? []
-            groups = pruneStaleHookGroups(groups)
-            let ourHook: [String: Any] = [
-                "type":    "command",
-                "command": "\(notifyPath) \(agentArg) \(arg)",
-                "timeout": timeout,
-            ]
-            // Swift's [String: Any] doesn't preserve key order; the
-            // resulting JSON is still valid. All three agents parse
-            // by key.
-            groups.append([
-                "matcher": "",
-                "hooks":   [ourHook],
-            ])
-            hooks[event] = groups
-        }
-
-        root["hooks"] = hooks
-        try writeJSONObject(root, to: path)
-    }
-
-    private static func wireCursorHooks(at path: String) throws {
-        var root = try readJSONObject(at: path)
-        var hooks = root["hooks"] as? [String: Any] ?? [:]
-
-        // Cursor has a single "stop" event; its shape is a flat array
-        // of hook entries (not the matcher-group nesting Claude uses).
-        var stops = hooks["stop"] as? [[String: Any]] ?? []
-        stops = pruneStaleHookEntries(stops)
-        stops.append([
-            "type":    "command",
-            "command": "\(notifyPath) cursor stop",
-        ])
-        hooks["stop"] = stops
-
-        root["hooks"] = hooks
-        try writeJSONObject(root, to: path)
-    }
-
-    // Remove any "group" (Claude's matcher-group shape) whose inner
-    // hooks reference a stale tinynudge/stack-nudge notify.sh.
-    private static func pruneStaleHookGroups(_ groups: [[String: Any]]) -> [[String: Any]] {
-        groups.compactMap { group in
-            let inner = group["hooks"] as? [[String: Any]] ?? []
-            let kept = pruneStaleHookEntries(inner)
-            if kept.isEmpty { return nil }
-            if kept.count != inner.count {
-                var copy = group
-                copy["hooks"] = kept
-                return copy
+    // Launch-time pass over every agent that's already wired: adds hooks this
+    // version introduced, drops ones it no longer lists, and rewrites our
+    // commands to the current path and arg. Timeouts and matchers stay as the
+    // user has them, so a manifest timeout change needs "Set up" to land. It
+    // writes nothing when the config already matches. An agent the user
+    // never wired stays unwired (the Settings banner offers that), and a
+    // config that doesn't parse is left untouched.
+    // Returns the agents whose config it rewrote.
+    @discardableResult
+    static func reconcileWiredAgents() -> [BootstrapAgent] {
+        guard isInstalled(), let manifest = HookManifest.bundled() else { return [] }
+        // An older build than the one that last reconciled stays out of it.
+        guard manifest.version >= readHooksApplied().version else { return [] }
+        return availableAgents().filter { isAgentWired($0) }.filter { agent in
+            do {
+                return try reconcileHooks(for: agent, manifest: manifest, everything: false)
+            } catch {
+                log("left \(agent.rawValue) hooks alone: \(error.localizedDescription)")
+                return false
             }
-            return group
         }
     }
 
-    // Remove individual hook entries (Cursor's flat shape) referencing
-    // a stale notify.sh path. Uses the same regex as uninstall.sh.
-    private static func pruneStaleHookEntries(_ entries: [[String: Any]]) -> [[String: Any]] {
-        entries.filter { entry in
-            let command = (entry["command"] as? String) ?? ""
-            return !isStaleHook(command: command)
+    @discardableResult
+    private static func reconcileHooks(for agent: BootstrapAgent, manifest: HookManifest, everything: Bool) throws -> Bool {
+        guard let spec = manifest.agents[agent] else { return false }
+        let path = agent.hookConfigPath
+        var root = try readJSONObject(at: path)
+        // A `hooks` value that isn't an object is someone else's shape: refuse
+        // rather than overwrite it with ours.
+        if let existing = root["hooks"], !(existing is [String: Any]) {
+            throw BootstrapError.writeFailed(path, underlying: CocoaError(.fileReadCorruptFile))
         }
+        var record = readHooksApplied()
+        let before = record
+        let outcome: HookReconciler.Outcome
+        do {
+            outcome = try HookReconciler.reconcile(
+                hooks: root["hooks"] as? [String: Any] ?? [:], spec: spec,
+                applied: record.agents[agent.rawValue].map(Set.init),
+                notifyPath: notifyPath, ourScript: isOurScript(_:), everything: everything)
+        } catch {
+            throw BootstrapError.writeFailed(path, underlying: error)
+        }
+        if let hooks = outcome.hooks {
+            root["hooks"] = hooks
+            try writeJSONObject(root, to: path)
+            log("reconciled \(agent.rawValue) hooks with this version's manifest")
+        }
+        record.agents[agent.rawValue] = outcome.applied.sorted()
+        record.version = max(record.version, manifest.version)
+        // Written after the config: a record ahead of the config would read a
+        // never-added hook as deleted by hand. A failed write is logged, not
+        // thrown: the config is already written (Codex still needs its re-trust
+        // banner), and a lost record only falls back to the legacy set.
+        if record != before {
+            do { try writeHooksApplied(record) } catch { log("hooks-applied record not saved: \(error.localizedDescription)") }
+        }
+        return outcome.hooks != nil
+    }
+
+    private struct HooksApplied: Equatable {
+        var version = 0
+        var agents: [String: [String]] = [:]
+    }
+
+    // A missing or unreadable record reads as "nothing applied yet", which falls
+    // back to the legacy hooks: the conservative side, adding only new ones.
+    private static func readHooksApplied() -> HooksApplied {
+        guard let data = FileManager.default.contents(atPath: hooksAppliedPath),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return HooksApplied() }
+        return HooksApplied(version: object["manifest_version"] as? Int ?? 0,
+                            agents: object["agents"] as? [String: [String]] ?? [:])
+    }
+
+    private static func writeHooksApplied(_ record: HooksApplied) throws {
+        let object: [String: Any] = ["manifest_version": record.version, "agents": record.agents]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: hooksAppliedPath), options: [.atomic])
+        } catch {
+            throw BootstrapError.writeFailed(hooksAppliedPath, underlying: error)
+        }
+    }
+
+    // A command's first token is our installed notify.sh: ~/.stack-nudge, or the
+    // legacy ~/.tinynudge, optionally quoted. Installs always live in a dot
+    // directory, so a developer's checkout (…/src/stack-nudge/notify.sh) wired
+    // by hand isn't ours to repoint.
+    static let ourScriptRegex = try? NSRegularExpression(
+        pattern: #"^"?(?:.*/)?\.(?:tinynudge|stack-nudge)/notify\.sh"?$"#
+    )
+
+    static func isOurScript(_ token: String) -> Bool {
+        guard let regex = ourScriptRegex else { return false }
+        return regex.firstMatch(in: token, range: NSRange(token.startIndex..., in: token)) != nil
     }
 
     private static func isStaleHook(command: String) -> Bool {
@@ -954,40 +959,29 @@ enum Bootstrap {
         return regex.firstMatch(in: command, options: [], range: range) != nil
     }
 
-    // Uninstall reverse: strip stale entries (the regex matches both old
-    // and current paths) from any agent config that still has them.
-    private static func unwireHooks(at path: String) throws {
-        var root = try readJSONObject(at: path)
-        guard var hooks = root["hooks"] as? [String: Any] else { return }
+    // The events uninstall always stripped broadly, for a build that somehow
+    // lacks its manifest.
+    private static let legacyHookEvents: Set<String> = ["Stop", "PermissionRequest", "AfterAgent", "Notification", "stop"]
 
-        // Matcher-group shape — shared by Claude (Stop/PermissionRequest),
-        // Codex (same names), and Gemini (AfterAgent/Notification).
-        // Iterating all four event names is harmless: events not present
-        // are simply skipped.
-        for event in ["Stop", "PermissionRequest", "AfterAgent", "Notification"] {
-            if let groups = hooks[event] as? [[String: Any]] {
-                let cleaned = pruneStaleHookGroups(groups)
-                if cleaned.isEmpty {
-                    hooks.removeValue(forKey: event)
-                } else {
-                    hooks[event] = cleaned
-                }
-            }
-        }
-        // Cursor shape: flat array
-        if let stops = hooks["stop"] as? [[String: Any]] {
-            let cleaned = pruneStaleHookEntries(stops)
-            if cleaned.isEmpty {
-                hooks.removeValue(forKey: "stop")
-            } else {
-                hooks["stop"] = cleaned
-            }
-        }
-
-        if hooks.isEmpty {
+    // Uninstall reverse. Under the manifest's events, every entry the stale-path
+    // regex matches goes, as before; under any other event (one a newer version
+    // wired before a downgrade, say) only our exact form does.
+    private static func unwireHooks(_ root: [String: Any], at path: String,
+                                    agent: BootstrapAgent, spec: AgentHookSpec?) throws {
+        var root = root
+        guard let hooks = root["hooks"] as? [String: Any] else { return }
+        let agentArg = spec?.agentArg ?? (agent == .claude ? "claude-code" : agent.rawValue)
+        let cleaned = HookReconciler.pruned(
+            hooks, broadEvents: spec.map { Set($0.hooks.map(\.event)) } ?? legacyHookEvents,
+            isBroadlyOurs: isStaleHook(command:),
+            isExactlyOurs: { HookReconciler.isExactlyOurs($0, agentArg: agentArg, ourScript: isOurScript) })
+        // Nothing of ours: not written, so a config we couldn't write anyway
+        // doesn't stop the uninstall.
+        if NSDictionary(dictionary: cleaned).isEqual(to: hooks) { return }
+        if cleaned.isEmpty {
             root.removeValue(forKey: "hooks")
         } else {
-            root["hooks"] = hooks
+            root["hooks"] = cleaned
         }
         try writeJSONObject(root, to: path)
     }
@@ -1000,12 +994,20 @@ enum Bootstrap {
         let url = URL(fileURLWithPath: path)
         let data = try Data(contentsOf: url)
         if data.isEmpty { return [:] }
-        let parsed = try JSONSerialization.jsonObject(with: data)
-        return (parsed as? [String: Any]) ?? [:]
+        // Anything but an object is refused rather than read as empty: the
+        // caller writes the result back, and that would wipe the file.
+        guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw BootstrapError.writeFailed(path, underlying: CocoaError(.fileReadCorruptFile))
+        }
+        return parsed
     }
 
     private static func writeJSONObject(_ root: [String: Any], to path: String) throws {
-        let url = URL(fileURLWithPath: path)
+        // Write through a symlink (dotfile managers link these files) rather
+        // than replacing it, and keep the file's permissions: the atomic write
+        // below renames a fresh file into place.
+        let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        let permissions = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.posixPermissions]
         let parent = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: parent,
@@ -1013,7 +1015,7 @@ enum Bootstrap {
         )
         let data = try JSONSerialization.data(
             withJSONObject: root,
-            options: [.prettyPrinted, .sortedKeys]
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
         // Trailing newline so the file is well-formed for line-oriented
         // tools (some editors get cranky without it).
@@ -1021,6 +1023,9 @@ enum Bootstrap {
         out.append(0x0A)
         do {
             try out.write(to: url, options: [.atomic])
+            if let permissions {
+                try? FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
+            }
         } catch {
             throw BootstrapError.writeFailed(path, underlying: error)
         }
@@ -1672,6 +1677,7 @@ struct UninstallView: View {
 enum BootstrapError: LocalizedError {
     case copyFailed(String, underlying: Error)
     case writeFailed(String, underlying: Error)
+    case hooksNotRemoved([String])
     case launchctlFailed(label: String, exitCode: Int32, stderr: String)
     case bundleResourceMissing(String)
 
@@ -1681,6 +1687,12 @@ enum BootstrapError: LocalizedError {
             return "Failed to copy \(what): \(err.localizedDescription)"
         case .writeFailed(let what, let err):
             return "Failed to write \(what): \(err.localizedDescription)"
+        case .hooksNotRemoved(let paths):
+            return "Couldn't remove StackNudge's hooks from \(paths.joined(separator: ", ")). StackNudge's "
+                + "background agents are stopped, but ~/.stack-nudge and the app are still here, since "
+                + "those hooks still run ~/.stack-nudge/notify.sh. Make the folder holding each file "
+                + "writable (it may be owned by root after a sudo run), or delete the hook lines that "
+                + "run .stack-nudge/notify.sh yourself, then run Uninstall again."
         case .launchctlFailed(let label, let code, let stderr):
             let msg = stderr.isEmpty ? "exit \(code)" : stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             return "launchctl failed for \(label): \(msg)"
