@@ -12,6 +12,9 @@ enum PanelMode: Hashable {
     case extensionTab(String)
     case settings
     case phrases
+    // Which grants StackNudge has. A sub-page of Settings, also opened from the
+    // setup screen; permissionsReturnMode says which one ← goes back to.
+    case permissions
     // The extension browser. Absent from orderedTabs like .phrases: it is a
     // sub-page of Settings, not a tab.
     case extensions
@@ -274,7 +277,11 @@ final class PanelNav: ObservableObject {
         }
     }
     @Published var selectedSettingIndex: Int = 0 {
-        didSet { anchoredSettingRow = selectedRow }
+        didSet {
+            // A re-anchor can move the index without moving off the row.
+            if selectedRow != anchoredSettingRow { pickingValue = false }
+            anchoredSettingRow = selectedRow
+        }
     }
 
     // What the selection is actually *on*, remembered so it can survive the row
@@ -702,7 +709,7 @@ final class PanelNav: ObservableObject {
     // so a client losing its data can't strand the selection out of range.
     @Published var usageClientIndex: Int = 0 { didSet { widgetQuotaCache = nil } }
     // When true, keyboard focus is inside the Usage detail pane: ↑/↓ scroll it
-    // rather than switching client. →/Enter steps in; ←/Esc steps back out.
+    // rather than switching client. →/Enter steps in; ← steps back out.
     @Published var usageDetailFocused: Bool = false
     // Which pane of the detail carousel is showing. While the detail holds
     // focus, → steps forward through the panes and ← steps back — stepping back
@@ -934,6 +941,16 @@ final class PanelNav: ObservableObject {
     // ⏎ and ⌫ mean different things depending on the row.
     @Published var eventsPane: EventsPane = .live
     @Published var historyQuery: String = ""
+    // True while any text field in the panel has focus, when Esc cancels the
+    // field rather than hiding the panel. Kept by PanelController from the
+    // panel's first responder.
+    @Published var editingText = false
+    // Whether Esc cancels something rather than hiding the panel: a focused
+    // text field, or a shortcut being recorded.
+    var escapeCancels: Bool { editingText || recordingHotkey || recordingSpeakHotkey }
+    // Where ← leaves the Permissions page for: .settings, or .bootstrap when
+    // setup opened it. Setup has no tab strip, so the page keeps that look too.
+    @Published var permissionsReturnMode: PanelMode = .settings
     // Bumped when the panel's key handler wants the history filter field to take
     // the keyboard (the user pressed / or started typing). A counter rather than
     // a Bool because @FocusState can't be driven from an ObservableObject
@@ -1009,9 +1026,19 @@ final class PanelNav: ObservableObject {
     // stepped into its rows. Changing category resets the row selection, or the
     // index would point into the previous category's list.
     @Published var settingsCategory: SettingsCategory = .notifications {
-        didSet { if oldValue != settingsCategory { selectFirstCategoryRow() } }
+        didSet {
+            guard oldValue != settingsCategory else { return }
+            pickingValue = false
+            selectFirstCategoryRow()
+        }
     }
-    @Published var settingsDetailFocused = false
+    @Published var settingsDetailFocused = false {
+        didSet { if !settingsDetailFocused { pickingValue = false } }
+    }
+    // True while a value row is being picked: Space or ⏎ on the row starts it,
+    // ←/→ then step the value, and Space or ⏎ again settles it. Moving off the
+    // row or out of the category list settles it too.
+    @Published var pickingValue = false
 
     // ⌘1…⌘9. Tabs past this are reachable by ←/→ only.
     static let maxNumberedTabs = 9
@@ -1058,7 +1085,7 @@ final class PanelNav: ObservableObject {
     // That view resets to the category sidebar on every appearance, which is
     // right for a fresh visit and wrong for a return: the Extensions category
     // now holds a card per installed extension, so opening the third one and
-    // pressing Esc put the keyboard back on the sidebar, four keystrokes from
+    // stepping back put the keyboard back on the sidebar, four keystrokes from
     // where it had just been. Configuring two extensions in a row is exactly
     // the flow that happens in.
     var settingsResumeRow: SettingsRow?
@@ -1597,7 +1624,7 @@ final class PanelNav: ObservableObject {
 
     // Probe the runtime grants and record which aren't set yet.
     // Notifications is async, so the ordered list is assembled in its callback
-    // (same order the Permissions window renders them). denied and
+    // (same order the Permissions page renders them). denied and
     // not-yet-determined both count as missing — the panel can't fully
     // function without the grant either way. iTerm2 is the exception: only a
     // denial counts, because an undecided grant is asked for on first focus.
@@ -1712,6 +1739,10 @@ final class PanelNav: ObservableObject {
     // Enter: toggles flip, cycle rows step forward, actions fire, hotkey
     // row enters record mode.
     func activate() {
+        if selectedRowIsPicker {
+            pickingValue.toggle()
+            return
+        }
         switch selectedRow {
         case .wireAgents:    wireAllUnwiredAgents()
         case .dismissAgents: dismissAllUnwiredAgents()
@@ -1741,19 +1772,28 @@ final class PanelNav: ObservableObject {
         case .uninstall:        actions?.beginUninstall()
         case .quit:             actions?.quit()
         case .openRepo:         openRepository()
-        // Toggles + cycles flip/step on Enter, same as left/right.
+        // Toggles flip on Enter / Space. Value rows never get here: they pick.
         default: applyCycle(forward: true)
         }
     }
 
-    func cycleForward()  { applyCycle(forward: true) }
-    func cycleBackward() { applyCycle(forward: false) }
+    func cycleForward() {
+        guard pickingValue, selectedRowIsPicker else { return }
+        applyCycle(forward: true)
+    }
 
-    // Whether ←/→ do anything on the selected row — mirrors applyCycle's no-op
-    // branch so the Settings footer can dim the Cycle hint instead of
-    // advertising a key the row ignores. Exhaustive over SettingsRow for the
-    // same reason applyCycle is: a new row can't silently inherit a wrong hint.
-    var selectedRowRespondsToArrows: Bool {
+    func cycleBackward() {
+        guard pickingValue, selectedRowIsPicker else { return }
+        applyCycle(forward: false)
+    }
+
+    // Whether the selected row is a value picker: Space / ⏎ start and settle
+    // picking, and ←/→ step the value in between (cycleForward/cycleBackward
+    // gate on both). Every other row acts on Space / ⏎ and ignores the arrows,
+    // so → grazing a row on the way into a category can't change anything.
+    // Exhaustive over SettingsRow so a new row can't silently inherit the wrong
+    // answer.
+    var selectedRowIsPicker: Bool {
         switch selectedRow {
         case .wireAgents, .dismissAgents,
              .disconnectGithub, .editPhrases, .browseExtensions, .installedExtension,
@@ -1761,18 +1801,23 @@ final class PanelNav: ObservableObject {
              .releaseNotes, .checkUpdates, .uninstall, .quit, .clearHistory,
              .slackPaste, .slackIdentity, .slackTest, .openRepo, .none:
             return false
-        case .permissions, .update, .hotkey, .speakHotkey,
-             .banner, .muteWhenFocused, .mute, .muteDuration,
-             .remindUnanswered, .stalledSessions, .tabTitleNames, .pinPanel,
-             .keepOpenWhenEmpty, .launchAtLogin,
-             .widget, .snapToCorners, .widgetCorner, .widgetOpacity, .widgetContent, .mascot, .theme,
-             .soundEnabled, .agentDoneSound, .permissionSound,
-             .voiceEnabled, .voice, .voiceSpeed, .downloadVoiceModel,
-             .quotaTracking, .quotaAlerts, .alertThreshold, .pollFrequency,
-             .contextAlert, .showRemaining, .piApiBudget, .piLocalBudget,
-             .githubLinks, .hideShipped,
-             .historyPerSession, .eventHistory,
-             .slackEnabled, .slackIdle, .slackDetail, .slackStop:
+        case .banner, .muteWhenFocused, .mute, .tabTitleNames, .pinPanel,
+             .keepOpenWhenEmpty, .launchAtLogin, .widget, .snapToCorners,
+             .soundEnabled, .voiceEnabled,
+             .quotaTracking, .quotaAlerts, .showRemaining,
+             .githubLinks, .hideShipped, .eventHistory,
+             .slackEnabled, .slackDetail, .slackStop:
+            return false
+        case .permissions, .update, .hotkey, .speakHotkey, .downloadVoiceModel:
+            return false
+        case .muteDuration, .remindUnanswered, .stalledSessions,
+             .widgetCorner, .widgetOpacity, .widgetContent, .mascot, .theme,
+             .agentDoneSound, .permissionSound,
+             .voice, .voiceSpeed,
+             .alertThreshold, .pollFrequency,
+             .contextAlert, .piApiBudget, .piLocalBudget,
+             .historyPerSession,
+             .slackIdle:
             return true
         }
     }
@@ -1826,17 +1871,6 @@ final class PanelNav: ObservableObject {
 
     private func applyCycle(forward: Bool) {
         switch selectedRow {
-        case .permissions:
-            // Nothing to cycle — arrows open the Permissions window, like Enter.
-            actions?.checkPermissions()
-        case .update:
-            // Nothing to cycle — arrows behave like Enter.
-            actions?.beginUpdate()
-        case .hotkey:
-            // Cycle on the hotkey row also enters record mode.
-            startRecordingHotkey()
-        case .speakHotkey:
-            startRecordingSpeakHotkey()
         case .banner:
             bannerEnabled.toggle()
             ConfigFile.write(key: "STACKNUDGE_BANNER", value: bannerEnabled ? "true" : "false")
@@ -1847,7 +1881,7 @@ final class PanelNav: ObservableObject {
             tabTitleNames.toggle()
             ConfigFile.write(key: "STACKNUDGE_TAB_TITLE_NAMES", value: tabTitleNames ? "true" : "false")
         case .mute:
-            // Action row: Enter and ←/→ both toggle the timed global mute.
+            // Action row: Enter / Space toggle the timed global mute.
             // Nothing persists — the controller owns the expiry timer + the
             // menu-bar badge (muteFor / resumeNotifications). Uses the current
             // default duration, same as the header bell and the M shortcut.
@@ -1960,9 +1994,6 @@ final class PanelNav: ObservableObject {
             let next = forward ? voiceSpeed + Self.speedStep : voiceSpeed - Self.speedStep
             voiceSpeed = max(Self.speedMin, min(Self.speedMax, (next * 100).rounded() / 100))
             ConfigFile.write(key: "STACKNUDGE_VOICE_SPEED", value: String(format: "%.2f", voiceSpeed))
-        case .downloadVoiceModel:
-            // Arrow on the pre-download row triggers the download too.
-            if !voiceModelDownloading { startVoiceModelDownload() }
         case .quotaTracking:
             toggleQuotaTracking()
         case .quotaAlerts:
@@ -2029,11 +2060,10 @@ final class PanelNav: ObservableObject {
             let next = forward ? (idx + 1) % list.count : (idx - 1 + list.count) % list.count
             eventsPerSession = list[next]
             ConfigFile.write(key: "STACKNUDGE_EVENTS_PER_SESSION", value: String(eventsPerSession))
-        // Action rows have nothing to cycle. The two banner rows deliberately
-        // ignore arrows even though .permissions/.update act on them: Set up
-        // rewrites agent hook configs and Not now persists a dismissal, so
-        // neither should fire on an arrow-key graze. Enter/Space only.
-        case .wireAgents, .dismissAgents,
+        // Action rows have nothing to cycle, and activate() handles each of
+        // them before it gets here.
+        case .wireAgents, .dismissAgents, .permissions, .update,
+             .hotkey, .speakHotkey, .downloadVoiceModel,
              .disconnectGithub, .editPhrases, .browseExtensions, .installedExtension,
              .checkPermissions, .openConfig,
              .releaseNotes, .checkUpdates, .uninstall, .quit, .clearHistory,

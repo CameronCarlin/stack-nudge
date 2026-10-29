@@ -138,6 +138,16 @@ The panel is installed and registered as a launchd agent by `./install.sh` — n
 
 Default hotkey is `cmd+opt+n`. Hit it from anywhere to summon the panel; hit it again while focused to hide. Switch tabs with `Cmd+1` (Events), `Cmd+2` (Sessions), `Cmd+3` (Usage), `Cmd+4` (Outcomes), `Cmd+5` (Settings), or click them. Banner and panel can run together, alone, or both off; the sound and voice still fire as passive signals.
 
+These keys work the same on every page, including while a text field has focus:
+
+| Key | Action |
+|-----|--------|
+| `Esc` | Hide the panel. In a text field it cancels the field instead: a filter, search or new phrase empties and hands the keyboard back to the page, a rename or config field keeps its saved value. While a shortcut is being recorded it cancels that and keeps the old one. The footer's last hint shows which. |
+| `⌘←` / `⌘→` | Previous / next tab. From a sub-page, the tabs either side of the one it belongs to. Not while recording a hotkey, so either can be recorded, and not on the setup screen or Permissions opened from it, which have no tabs. |
+| `⌫` in an empty text field | Cancel the field, as `Esc` does. A fresh press only: holding `⌫` to clear a field stops once it's empty. |
+
+Outside a text field, `←` is back a level on sub-pages and detail panes: out of a detail pane, or from a sub-page to the page it belongs under. The exception is picking a value in Settings, where `←` / `→` step the value.
+
 #### Events tab
 
 Recent nudges in chronological order. Each shows agent, message, project name, time.
@@ -156,7 +166,7 @@ When you press `⏎` on a permission event in a VS Code / Cursor terminal pane, 
 
 **Mute for a while.** Press `M` (or use the bell button in the panel header, or the menu-bar **Mute notifications** submenu) to silence *everything* — banner, sound, voice, and the focus jump — for a set duration, **including permission prompts**. Events keep flowing into the panel while muted; only the interruptions are suppressed. A live countdown shows on the header bell and the menu-bar icon (the compact widget just shows a muted-bell glyph), and the mute lifts itself when the timer runs out (or immediately if you press `M` / **Resume** again). The default duration is configurable (`STACKNUDGE_MUTE_DURATION_MIN`, one of 15 / 30 / 60 / 120, default 30) and can be cycled in Settings. Mute is in-memory only — it resets on relaunch.
 
-**History.** The list above is a live triage queue — capped, pruned per session, and gone when you quit. Press `H` for the durable log behind it: every nudge, newest first, with a filter box that matches on message, agent, and repo. `↑↓` and `⌘↑↓` walk the rows; start typing (or press `/`) to filter, and `Esc` clears the filter, then steps back to the queue.
+**History.** The list above is a live triage queue — capped, pruned per session, and gone when you quit. Press `H` for the durable log behind it: every nudge, newest first, with a filter box that matches on message, agent, and repo. `↑↓` and `⌘↑↓` walk the rows; start typing (or press `/`) to filter, `⏎` hands the keyboard back to the rows, and `←` steps back to the queue.
 
 History is deliberately a separate pane rather than more rows in the queue. The queue is an action list — `⏎` approves, `⌫` dismisses — and a replayed record has no FIFO to answer and no process to focus, so mixing the two would make those keys mean different things depending on which row you happened to land on.
 
@@ -242,7 +252,7 @@ Rows are ordered busy-first, then by most-recent activity. Status label reads `b
 | `↑ ↓` | Move selection |
 | `⏎` | Focus the session's source terminal |
 | `n` | Rename the selected session inline |
-| `⌫` | Send SIGTERM to the agent process |
+| `⌘⌫` | Send SIGTERM to the agent process |
 | `Esc` | Hide the panel |
 
 #### Usage tab
@@ -294,9 +304,11 @@ Reachable from the tab strip or `Cmd+5`. Keyboard-driven rows for hotkey, behavi
 | Key | Action |
 |-----|--------|
 | `↑ ↓` / `Tab` | Move selection |
-| `← →` | Cycle the selected row's value (toggles flip, sounds/voices step) |
-| `⏎` | Activate (toggles flip, action rows fire, hotkey row records a new combo) |
-| `Esc` | Back to events |
+| `Space` / `⏎` | Activate (toggles flip, action rows fire, hotkey row records a new combo). On a value row (sound, voice, duration, threshold) it starts picking. |
+| `←` / `→` while picking | Step through the values (sounds and voices preview as you go) |
+| `Space` / `⏎` while picking | Settle on the value. Moving to another row settles it too. |
+| `←` | Back to the category list |
+| `Esc` | Hide the panel |
 
 The hotkey row records live: press `⏎` on it, press the new combo, and stack-nudge re-registers the global hotkey. If the combo is already grabbed by another app, the previous one stays and an inline error explains why.
 
@@ -350,7 +362,7 @@ When the panel daemon is running, a bell icon appears in your menu bar. The same
 | `Voice notifications` | Toggles spoken notifications. Enabling speaks *"Voice notifications enabled"*. |
 | `Mute notifications ▸` | Submenu (For 15m / 30m / 1h / 2h) to silence all nudges for a set time. While muted the item becomes `Resume notifications` and the menu-bar icon shows a `bell.slash` + countdown. |
 | `Show panel` | Brings the floating panel up (handy when no events are queued) |
-| `Check permissions…` | Opens the permissions checker (see below) |
+| `Check permissions…` | Opens the Permissions page in the panel (see below) |
 | `Open config file…` | Opens `~/.stack-nudge/config` in your default editor |
 | `Quit stack-nudge panel` | Exits the daemon |
 
@@ -365,18 +377,23 @@ The panel needs two privacy grants to fully work:
 | **Accessibility**                | Required for `AXIsProcessTrusted()` to return true — without it, the Enter-to-approve keystroke is silently skipped |
 | **Automation → System Events**   | Required for the AppleScript that focuses the right app and window when you act on a nudge        |
 
-Open **Check permissions…** from the menu bar for a live status view. Each row has:
+The Permissions page shows each grant's live status. It's a Settings sub-page: open it from **Settings › Actions › Check permissions**, the "Permissions needed" row at the top of Settings, **Check permissions…** in the menu bar, or **Grant permissions** on the setup screen.
 
-- **Reset & prompt** — clears the existing TCC entry, then triggers macOS's standard grant dialog
-- **Settings** — opens System Settings to the right pane
+| Key | Action |
+|-----|--------|
+| `↑ ↓` | Move selection |
+| `⏎` | Prompt for the selected grant. For Accessibility and Automation that's **Reset & prompt**, which clears the existing TCC entry and then triggers macOS's grant dialog. Notifications only asks, and once you've answered, the switch is in System Settings. |
+| `⌘⏎` | Open System Settings at the right pane |
+| `⌘R` | Check every grant again |
+| `←` | Back to Settings, or to setup if you came from there |
 
-The window is set to float above System Settings so you can grant both in one pass without losing it.
+The panel (or the expanded widget) stays up on this page even when a grant prompt or System Settings takes focus, so you can work through every grant in one pass; drag it aside if it covers System Settings. The page checks again whenever the panel becomes key, so a grant made in System Settings shows up when you click back.
 
 #### The rebuild gotcha
 
 stack-nudge's apps are **ad-hoc signed**, so every rebuild produces a new cdhash. macOS's TCC database binds permissions to that cdhash, which means a fresh build silently invalidates prior grants — even though System Settings still *shows* the entry as "on". `AXIsProcessTrusted()` returns false because the running binary's hash no longer matches.
 
-If approval has stopped working after a rebuild, hit **Reset & prompt** in the permissions checker. It runs `tccutil reset`, then triggers a fresh dialog bound to the current cdhash.
+If approval has stopped working after a rebuild, hit **Reset & prompt** on the Permissions page. It runs `tccutil reset`, then triggers a fresh dialog bound to the current cdhash.
 
 ### Auto-update
 
@@ -401,7 +418,7 @@ The phrase pools that power [Voice notifications](#voice-notifications) can be c
 
 - Toggle individual built-in phrases on or off (`Space`)
 - Add your own custom phrases (typed inline, `Enter` to commit)
-- Remove custom phrases (`⌫`)
+- Remove custom phrases (`⌘⌫`)
 
 Per-pool customisations are stored in `~/.stack-nudge/phrases.user.json` and merged with the built-in pools at notification time. Disable a built-in phrase you find too cheery, add ones in your own voice — the same random-selection logic still applies.
 
@@ -495,7 +512,7 @@ make test-notify # drive notify.sh against a fake panel socket (macOS, no Xcode)
 
 Source layout:
 
-- `panel/` — the single persistent `stack-nudge.app` binary: hotkey, floating NSPanel, socket listener for incoming events, macOS banner posting via `UNUserNotificationCenter`, sessions list, settings, permissions window, auto-updater, quota probe
+- `panel/` — the single persistent `stack-nudge.app` binary: hotkey, floating NSPanel, socket listener for incoming events, macOS banner posting via `UNUserNotificationCenter`, sessions list, settings and its Permissions page, auto-updater, quota probe
 - `shared/` — code shared with the standalone Linux/Windows surfaces (currently `AppActivator.swift`)
 - `phrases/` — per-language voice phrase pools sourced by `notify.sh` at hook time
 - `notify.sh` — the shell entry-point CC/Cursor/Gemini hooks invoke; on macOS posts events to the running app via Unix-domain socket, on Linux/Windows handles audio + libnotify directly

@@ -237,16 +237,50 @@ struct ShedToFitLayout: Layout {
 
 // MARK: - Page-level layout
 
+// Mirror PanelNav.editingText and PanelNav.escapeCancels for views that don't
+// hold the nav. Set once at the root of the panel's content.
+private struct EditingTextKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+private struct EscapeCancelsKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var editingText: Bool {
+        get { self[EditingTextKey.self] }
+        set { self[EditingTextKey.self] = newValue }
+    }
+
+    var escapeCancels: Bool {
+        get { self[EscapeCancelsKey.self] }
+        set { self[EscapeCancelsKey.self] = newValue }
+    }
+}
+
 // Bottom strip every panel page shares: hint pills on the right, hairline
 // divider above, subtle tint behind. Pages just fill the hints slot. (The
 // brand mark lives once in the top tab strip; the footer stays icon-free.)
+//
+// Esc works on every page, so the bar adds that hint itself, last and outside
+// the shedding layout: it is always the rightmost hint and is never the one a
+// narrow panel gives up. Pages don't list it. It reads "Cancel" while a text
+// field has focus or a shortcut is being recorded, since Esc cancels those,
+// and "Hide" otherwise.
 struct PageFooter<Hints: View>: View {
 
     @ViewBuilder var hints: () -> Hints
+    @Environment(\.escapeCancels) private var escapeCancels
+
+    static func escapeLabel(cancels: Bool) -> String { cancels ? "Cancel" : "Hide" }
 
     var body: some View {
-        ShedToFitLayout {
-            hints()
+        HStack(spacing: 0) {
+            ShedToFitLayout {
+                hints()
+            }
+            FooterHint(label: Self.escapeLabel(cancels: escapeCancels), keys: ["Esc"])
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)

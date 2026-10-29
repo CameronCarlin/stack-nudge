@@ -34,29 +34,30 @@ struct SettingsView: View {
 
             PageFooter {
                 if nav.recordingHotkey || nav.recordingSpeakHotkey {
+                    // Esc cancels it too; PageFooter shows that as its last hint.
                     FooterHint(label: "Press a combo with ⌘ / ⇧ / ⌥ / ⌃", keys: [], primary: true)
-                    FooterHint(label: "Cancel", keys: ["Esc"])
+                    FooterHint(label: "Cancel and move", keys: ["↑", "↓"])
+                } else if nav.pickingValue {
+                    FooterHint(label: "Choose", keys: ["←", "→"], primary: true)
+                    FooterHint(label: "Done", keys: ["␣", "⏎"])
+                    // Also settles the pick where it stands.
+                    FooterHint(label: "Move", keys: ["↑", "↓"])
                 } else {
                     if nav.settingsDetailFocused {
                         FooterHint(label: "Move", keys: ["↑", "↓"])
                         // Works at both levels, but only worth advertising
                         // here — on the sidebar it duplicates plain ↑↓.
                         FooterHint(label: "Category", keys: ["⌘↑↓"])
-                        // Always rendered so the footer doesn't reflow as
-                        // selection moves, dimmed on the rows where ←/→ do
-                        // nothing — the same treatment the events page gives
-                        // its Snooze hint. Enter acts on every row, so "Act"
-                        // never dims.
-                        FooterHint(label: "Cycle", keys: ["←", "→"])
-                            .opacity(nav.selectedRowRespondsToArrows ? 1.0 : 0.35)
-                        FooterHint(label: "Act", keys: ["⏎"])
+                        // Space / Enter do something on every row: act on it,
+                        // or start picking a value row.
+                        FooterHint(label: nav.selectedRowIsPicker ? "Pick" : "Act", keys: ["␣", "⏎"])
                     } else {
                         FooterHint(label: "Category", keys: ["↑", "↓"])
                         FooterHint(label: "Open", keys: ["→"])
                     }
-                    // One Esc hint, naming where it actually goes from here.
-                    FooterHint(label: nav.settingsDetailFocused ? "Categories" : "Hide",
-                               keys: ["Esc"])
+                    if nav.settingsDetailFocused {
+                        FooterHint(label: "Categories", keys: ["←"])
+                    }
                 }
             }
         }
@@ -405,7 +406,7 @@ struct SettingsView: View {
     // Runtime-permission nudge pinned above the settings sections when one or
     // more grants (Accessibility / Automation / Notifications) aren't set.
     // Keyboard-navigable like the update row — selecting + Enter, or a click,
-    // opens the Permissions window. Orange (not accent) to read as "needs
+    // opens the Permissions page. Orange (not accent) to read as "needs
     // attention" rather than the update affordance.
     private func permissionsRow(_ missing: [SettingsPane]) -> some View {
         let selected = nav.selectedSettingIndex == nav.index(of: .permissions)
@@ -879,7 +880,8 @@ struct SettingsView: View {
             label: label,
             value: value,
             kind: kind,
-            selected: nav.settingsDetailFocused && nav.selectedSettingIndex == nav.index(of: id)
+            selected: nav.settingsDetailFocused && nav.selectedSettingIndex == nav.index(of: id),
+            picking: nav.pickingValue && nav.selectedRow == id
         )
         // Visual-only dimming when a row is gated by another setting
         // (Sound section's deps when Sound is off; Usage deps when
@@ -906,6 +908,9 @@ private struct SettingsRowView: View {
     let value: String
     let kind: SettingsKind
     let selected: Bool
+    // A value row being picked shows ‹ › either side of its value, the keys
+    // that now step it.
+    var picking = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -932,9 +937,13 @@ private struct SettingsRowView: View {
                 .font(.callout)
                 .foregroundStyle(value == "On" ? Color.green : Color.secondary)
         case .cycle:
-            Text(value)
-                .font(.subheadline.monospaced())
-                .foregroundStyle(selected ? Color.primary : .secondary)
+            HStack(spacing: 6) {
+                if picking { Image(systemName: "chevron.left").font(.caption.weight(.semibold)) }
+                Text(value)
+                    .font(.subheadline.monospaced())
+                if picking { Image(systemName: "chevron.right").font(.caption.weight(.semibold)) }
+            }
+            .foregroundStyle(picking ? Color.accentColor : selected ? Color.primary : .secondary)
         case .mute:
             // value is non-empty ("27m left") only while muted, so it doubles
             // as the muted flag for the glyph/tint — no separate state needed.
